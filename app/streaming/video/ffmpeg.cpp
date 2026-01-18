@@ -243,9 +243,6 @@ FFmpegVideoDecoder::FFmpegVideoDecoder(bool testOnly)
     SDL_zero(m_GlobalVideoStats);
 
     SDL_AtomicSet(&m_DecoderThreadShouldQuit, 0);
-
-    // Use linear filtering when renderer scaling is required
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
 }
 
 FFmpegVideoDecoder::~FFmpegVideoDecoder()
@@ -491,6 +488,8 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     }
 
     m_RequiredPixelFormat = requiredFormat;
+    m_OriginalVideoWidth = params->width;
+    m_OriginalVideoHeight = params->height;
     m_StreamFps = params->frameRate;
     m_VideoFormat = params->videoFormat;
     m_CurrentTestMode = testMode;
@@ -662,6 +661,27 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
             return false;
         }
 
+        // Most FFmpeg decoders process input using a "push" model.
+        // We'll see those fail here if the format is not supported.
+        err = avcodec_send_packet(m_VideoDecoderCtx, m_Pkt);
+        if (err < 0) {
+            char errorstring[512];
+            av_strerror(err, errorstring, sizeof(errorstring));
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Test decode failed (avcodec_send_packet): %s", errorstring);
+            return false;
+        }
+
+        // Signal EOS to force the decoder to immediately output the frame
+        err = avcodec_send_packet(m_VideoDecoderCtx, nullptr);
+        if (err < 0) {
+            char errorstring[512];
+            av_strerror(err, errorstring, sizeof(errorstring));
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Test flush failed (avcodec_send_packet): %s", errorstring);
+            return false;
+        }
+
         AVFrame* frame = av_frame_alloc();
         if (!frame) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -669,47 +689,21 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
             return false;
         }
 
-        // Some decoders won't output on the first frame, so we'll submit
-        // a few test frames if we get an EAGAIN error.
-        for (int retries = 0; retries < 5; retries++) {
-            // Most FFmpeg decoders process input using a "push" model.
-            // We'll see those fail here if the format is not supported.
-            err = avcodec_send_packet(m_VideoDecoderCtx, m_Pkt);
-            if (err < 0) {
-                av_frame_free(&frame);
-                char errorstring[512];
-                av_strerror(err, errorstring, sizeof(errorstring));
+        err = avcodec_receive_frame(m_VideoDecoderCtx, frame);
+        if (err == 0) {
+            // Allow the renderer to do any validation it wants on this frame
+            if (!m_FrontendRenderer->testRenderFrame(frame)) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "Test decode failed (avcodec_send_packet): %s", errorstring);
+                            "Test decode failed (testRenderFrame)");
+                av_frame_free(&frame);
                 return false;
             }
-
-            // A few FFmpeg decoders (h264_mmal) process here using a "pull" model.
-            // Those decoders will fail here if the format is not supported.
-            err = avcodec_receive_frame(m_VideoDecoderCtx, frame);
-            if (err == AVERROR(EAGAIN)) {
-                // Wait a little while to let the hardware work
-                SDL_Delay(100);
-            }
-            else {
-                // Done!
-                break;
-            }
         }
-
-        if (err < 0) {
+        else if (err < 0) {
             char errorstring[512];
             av_strerror(err, errorstring, sizeof(errorstring));
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "Test decode failed (avcodec_receive_frame): %s", errorstring);
-            av_frame_free(&frame);
-            return false;
-        }
-
-        // Allow the renderer to do any validation it wants on this frame
-        if (!m_FrontendRenderer->testRenderFrame(frame)) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Test decode failed (testRenderFrame)");
             av_frame_free(&frame);
             return false;
         }
@@ -1889,6 +1883,32 @@ void FFmpegVideoDecoder::decoderThreadProc()
 
                             clm->MaxCLL = hdrMetadata.maxContentLightLevel;
                             clm->MaxFALL = hdrMetadata.maxFrameAverageLightLevel;
+                        }
+                    }
+
+                    // Some encoders (like RDNA3's AV1 encoder) include excess padding and expect us
+                    // to crop it off. If we find our received frame looks close to our requested
+                    // size (where "close" is arbitrarily defined as "within 64 pixels") then just
+                    // crop the video to our requested size instead.
+                    if (frame->width != m_OriginalVideoWidth || frame->height != m_OriginalVideoHeight) {
+                        int cropWidth = frame->width - m_OriginalVideoWidth;
+                        int cropHeight = frame->height - m_OriginalVideoHeight;
+
+                        if (cropWidth >= 0 && cropWidth < 64 && cropHeight >= 0 && cropHeight < 64) {
+                            if (m_FramesOut == 1) {
+                                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                            "Cropping incoming frames from (%d, %d) to (%d, %d)",
+                                            frame->width,
+                                            frame->height,
+                                            m_OriginalVideoWidth,
+                                            m_OriginalVideoHeight);
+                            }
+
+                            // We assume that all padding is added to the right and bottom.
+                            // This is true for the known affected encoders.
+                            frame->crop_right = cropWidth;
+                            frame->crop_bottom = cropHeight;
+                            av_frame_apply_cropping(frame, 0);
                         }
                     }
 
